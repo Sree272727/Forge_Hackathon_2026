@@ -1,0 +1,201 @@
+"""FastAPI service for Rosetta."""
+from __future__ import annotations
+
+import logging
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from .audit import audit_workbook
+from .evaluator import Evaluator
+from .graph import backward_trace, forward_impacted, forward_impacted_for_named_range
+from .models import QAResponse, WhatIfImpact, WhatIfResponse
+from .parser import parse_workbook
+from .qa import answer
+from .store import store
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+
+app = FastAPI(title="Rosetta — Excel Intelligence Agent", version="0.1.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+class AskRequest(BaseModel):
+    workbook_id: str
+    question: str
+
+
+class WhatIfRequest(BaseModel):
+    workbook_id: str
+    assumption: str  # named range OR cell ref
+    new_value: float
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "Rosetta",
+        "version": "0.1.0",
+        "endpoints": ["/ingest", "/ask", "/trace/{workbook_id}/{cell_ref}", "/audit/{workbook_id}", "/what-if", "/workbooks"],
+    }
+
+
+@app.post("/ingest")
+async def ingest(file: UploadFile = File(...)) -> dict[str, Any]:
+    if not file.filename.lower().endswith(".xlsx"):
+        raise HTTPException(400, "Only .xlsx files are supported")
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+    try:
+        wb = parse_workbook(tmp_path)
+        wb.filename = file.filename
+        wb.findings = audit_workbook(wb)
+        store.put(wb)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+    return {
+        "workbook_id": wb.workbook_id,
+        "filename": wb.filename,
+        "summary": _summarize(wb),
+    }
+
+
+def _summarize(wb) -> dict[str, Any]:
+    return {
+        "sheet_count": len(wb.sheets),
+        "hidden_sheets": [s.name for s in wb.sheets if s.hidden],
+        "total_cells": len(wb.cells),
+        "formula_cells": wb.graph_summary.total_formula_cells,
+        "cross_sheet_references": wb.graph_summary.cross_sheet_edges,
+        "max_dependency_depth": wb.graph_summary.max_depth,
+        "circular_references": [cr.model_dump() for cr in wb.graph_summary.circular_references],
+        "named_ranges": [{"name": nr.name, "scope": nr.scope, "resolves_to": nr.resolved_refs,
+                           "value": nr.current_value, "is_dynamic": nr.is_dynamic} for nr in wb.named_ranges],
+        "sheets": [
+            {
+                "name": s.name, "hidden": s.hidden,
+                "rows": s.max_row, "cols": s.max_col,
+                "formulas": s.formula_count,
+                "regions": [r.model_dump() for r in s.regions[:10]],
+                "hidden_rows": s.hidden_rows, "hidden_cols": s.hidden_cols,
+                "merged_cells": s.merged_cells[:10],
+            } for s in wb.sheets
+        ],
+        "finding_counts": {cat: sum(1 for f in wb.findings if f.category == cat) for cat in
+                           {f.category for f in wb.findings}},
+    }
+
+
+@app.post("/ask", response_model=QAResponse)
+def ask(req: AskRequest) -> QAResponse:
+    wb = store.get(req.workbook_id)
+    if not wb:
+        raise HTTPException(404, "workbook_id not found — ingest first")
+    return answer(wb, req.question)
+
+
+@app.get("/trace/{workbook_id}/{sheet}/{cell}")
+def trace(workbook_id: str, sheet: str, cell: str) -> dict[str, Any]:
+    wb = store.get(workbook_id)
+    if not wb:
+        raise HTTPException(404, "workbook not found")
+    ref = f"{sheet}!{cell}"
+    if ref not in wb.cells:
+        raise HTTPException(404, f"cell {ref} not found")
+    back = backward_trace(wb, ref, max_depth=8)
+    fwd = forward_impacted(wb, ref)
+    return {
+        "cell": ref,
+        "backward": back.model_dump(),
+        "forward": [{"ref": r, "depth": d, "label": wb.cells[r].semantic_label if r in wb.cells else None,
+                      "value": wb.cells[r].value if r in wb.cells else None} for r, d in fwd[:200]],
+    }
+
+
+@app.get("/audit/{workbook_id}")
+def audit(workbook_id: str) -> dict[str, Any]:
+    wb = store.get(workbook_id)
+    if not wb:
+        raise HTTPException(404, "workbook not found")
+    findings = wb.findings or audit_workbook(wb)
+    return {
+        "workbook_id": workbook_id,
+        "finding_count": len(findings),
+        "findings": [f.model_dump() for f in findings],
+    }
+
+
+@app.post("/what-if", response_model=WhatIfResponse)
+def what_if(req: WhatIfRequest) -> WhatIfResponse:
+    wb = store.get(req.workbook_id)
+    if not wb:
+        raise HTTPException(404, "workbook not found")
+    # Resolve target
+    target_ref: str | None = None
+    if req.assumption in wb.cells:
+        target_ref = req.assumption
+    else:
+        nr = next((n for n in wb.named_ranges if n.name.lower() == req.assumption.lower()), None)
+        if nr and nr.resolved_refs and ":" not in nr.resolved_refs[0]:
+            target_ref = nr.resolved_refs[0]
+    if not target_ref:
+        raise HTTPException(400, f"Could not resolve assumption '{req.assumption}' to a single cell.")
+    old_val = wb.cells[target_ref].value
+    ev = Evaluator(wb, overrides={target_ref: req.new_value})
+    # Find impacted
+    impacted_refs: list[str] = []
+    nr = next((n for n in wb.named_ranges if target_ref in n.resolved_refs), None)
+    if nr:
+        impacted_refs = [r for r, _ in forward_impacted_for_named_range(wb, nr.name)]
+    else:
+        impacted_refs = [r for r, _ in forward_impacted(wb, target_ref)]
+    affected: list[WhatIfImpact] = []
+    key: list[WhatIfImpact] = []
+    key_labels = ("ebitda", "gross profit", "revenue", "performance ratio", "service absorption", "noi", "net operating income")
+    for r in impacted_refs:
+        new_v = ev.value_of(r)
+        old_v = wb.cells[r].value
+        if new_v != old_v:
+            imp = WhatIfImpact(ref=r, label=wb.cells[r].semantic_label, old_value=old_v, new_value=new_v,
+                              depth=0, sheet=wb.cells[r].sheet)
+            affected.append(imp)
+            if imp.label and any(k in imp.label.lower() for k in key_labels):
+                key.append(imp)
+    explanation = (f"Set {target_ref} from {old_val} to {req.new_value}. "
+                   f"{len(affected)} downstream cells changed value. "
+                   f"{len(ev.unsupported)} formulas were not re-evaluatable (fell back to cached values).")
+    return WhatIfResponse(
+        changed_input=target_ref,
+        old_value=old_val,
+        new_value=req.new_value,
+        affected_cells=affected[:500],
+        key_outputs=key[:50],
+        unsupported_formulas=list(ev.unsupported)[:50],
+        explanation=explanation,
+        warnings=([f"{len(ev.unsupported)} formula(s) unsupported."] if ev.unsupported else []),
+    )
+
+
+@app.get("/workbooks")
+def list_workbooks() -> dict[str, Any]:
+    return {
+        "workbooks": [
+            {"workbook_id": wb.workbook_id, "filename": wb.filename,
+             "sheets": len(wb.sheets), "cells": len(wb.cells),
+             "formulas": wb.graph_summary.total_formula_cells}
+            for wb in store.list()
+        ]
+    }
+
+
+@app.get("/workbook/{workbook_id}")
+def get_workbook(workbook_id: str) -> dict[str, Any]:
+    wb = store.get(workbook_id)
+    if not wb:
+        raise HTTPException(404, "workbook not found")
+    return _summarize(wb)
