@@ -4,19 +4,22 @@ from __future__ import annotations
 import logging
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .audit import audit_workbook
+from .chat import chat as chat_engine
 from .evaluator import Evaluator
 from .graph import backward_trace, forward_impacted, forward_impacted_for_named_range
 from .models import QAResponse, WhatIfImpact, WhatIfResponse
 from .parser import parse_workbook
 from .qa import answer
-from .store import store
+from .store import chat_store, store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
@@ -35,12 +38,58 @@ class WhatIfRequest(BaseModel):
     new_value: float
 
 
+class ChatRequest(BaseModel):
+    workbook_id: str
+    message: str
+    session_id: Optional[str] = None
+
+
+# --- Static frontend ---
+
+_STATIC_DIR = Path(__file__).parent / "static"
+if _STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+
 @app.get("/")
 def root():
+    index = _STATIC_DIR / "index.html"
+    if index.exists():
+        return FileResponse(str(index))
     return {
         "service": "Rosetta",
         "version": "0.1.0",
-        "endpoints": ["/ingest", "/ask", "/trace/{workbook_id}/{cell_ref}", "/audit/{workbook_id}", "/what-if", "/workbooks"],
+        "endpoints": ["/ingest", "/ask", "/chat", "/trace/{workbook_id}/{cell_ref}", "/audit/{workbook_id}", "/what-if", "/workbooks"],
+    }
+
+
+@app.get("/api")
+def api_descriptor():
+    return {
+        "service": "Rosetta",
+        "version": "0.1.0",
+        "endpoints": ["/ingest", "/ask", "/chat", "/trace/{workbook_id}/{cell_ref}", "/audit/{workbook_id}", "/what-if", "/workbooks"],
+    }
+
+
+@app.post("/chat")
+def chat_endpoint(req: ChatRequest) -> dict[str, Any]:
+    wb = store.get(req.workbook_id)
+    if not wb:
+        raise HTTPException(404, "workbook_id not found — ingest first")
+    session = chat_store.get_or_create(req.session_id, req.workbook_id)
+    return chat_engine(wb, session, req.message)
+
+
+@app.get("/chat/{session_id}/history")
+def chat_history(session_id: str) -> dict[str, Any]:
+    session = chat_store.get(session_id)
+    if not session:
+        raise HTTPException(404, "session not found")
+    return {
+        "session_id": session.session_id,
+        "workbook_id": session.workbook_id,
+        "messages": session.messages,
     }
 
 
