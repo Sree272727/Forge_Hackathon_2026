@@ -291,21 +291,40 @@ def _find_cells(wb: WorkbookModel, keyword: str, has_formula: bool = False,
         return out
 
     def _run_semantic() -> list[dict]:
-        # v1.5 stub — v2 Option A will implement this via Qdrant
+        """v2A: semantic similarity search via Qdrant.
+
+        Opt-out path: set ROSETTA_SEMANTIC_DISABLED=1.
+        """
         import os
-        if os.environ.get("ROSETTA_SEMANTIC_ENABLED") != "1":
+        if os.environ.get("ROSETTA_SEMANTIC_DISABLED") == "1":
             return []
         try:
-            from .embeddings import QdrantIndex  # only exists in v2
-            idx = QdrantIndex()
-            results = idx.search(wb.workbook_id, keyword, limit=10)
-            return [
-                {"ref": r["ref"], "label": r["label"], "value": None,
-                 "has_formula": None, "formula": None,
-                 "score": r["score"], "tier_used": "semantic"}
-                for r in results if r["score"] > 0.4
-            ]
-        except Exception:
+            from .embeddings import QdrantIndex, is_enabled
+            if not is_enabled():
+                return []
+            results = QdrantIndex.search(wb.workbook_id, keyword, limit=10)
+            # Threshold: drop low-confidence matches
+            filtered = []
+            for r in results:
+                if r["score"] < 0.55:
+                    continue
+                cell = wb.cells.get(r["ref"])
+                filtered.append({
+                    "ref": r["ref"],
+                    "label": r["label"] or (cell.semantic_label if cell else None),
+                    "value": cell.value if cell else None,
+                    "has_formula": (cell.formula is not None) if cell else None,
+                    "formula": cell.formula if cell else None,
+                    "score": r["score"],
+                    "tier_used": "semantic",
+                    "context": r.get("context"),
+                })
+                if len(filtered) >= 10:
+                    break
+            return filtered
+        except Exception as e:
+            import logging
+            logging.getLogger("rosetta.tools").warning("semantic tier failed: %s", e)
             return []
 
     if tier == "exact":
@@ -314,16 +333,17 @@ def _find_cells(wb: WorkbookModel, keyword: str, has_formula: bool = False,
         results = _run_keyword()
     elif tier == "semantic":
         results = _run_semantic()
-    else:  # auto
+    else:  # auto — exact → keyword → (augment with semantic if weak)
         results = _run_exact()
-        if not results:
-            results = _run_keyword()
-            tier_used = "keyword"
-        else:
+        if results:
             tier_used = "exact"
-        if not results:
-            results = _run_semantic()
-            tier_used = "semantic" if results else "none"
+        else:
+            results = _run_keyword()
+            if results:
+                tier_used = "keyword"
+            else:
+                results = _run_semantic()
+                tier_used = "semantic" if results else "none"
 
     return {"matches": results, "count": len(results), "keyword": keyword,
              "tier_used": tier_used}

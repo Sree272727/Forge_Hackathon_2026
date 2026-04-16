@@ -6,6 +6,27 @@ Rosetta ingests complex Excel workbooks, extracts their full computational struc
 
 Rosetta is exposed as a FastAPI service so platforms like Lens can invoke it: send a workbook, ask a question, get an answer with a formula trace and confidence.
 
+## Current version: v2A
+
+**Agentic coordinator with citation auditor + semantic cell retrieval.**
+
+- **Coordinator agent** (Claude Sonnet 4.5) plans each question and
+  calls deterministic tools over the parsed workbook
+- **FormulaExplainer specialist** generates grounded narrative for
+  formula-explanation questions
+- **Citation auditor** verifies every number, cell ref, and named range
+  in the answer against tool results — returns "I don't know" before
+  ever hallucinating
+- **Three-tier cell lookup**: exact → keyword → semantic (Qdrant +
+  local sentence-transformers, falls back automatically)
+- **Multi-turn conversation memory** with active_entity tracking and
+  scenario override stacking for what-if questions
+
+See [docs/architecture_v2.md](docs/architecture_v2.md) for the full design,
+[docs/plan_v1_5.md](docs/plan_v1_5.md) for the v1.5 foundation, and
+[docs/plan_v2_upgrades.md](docs/plan_v2_upgrades.md) for the v2 upgrade
+plan. Deployment in [docs/deployment.md](docs/deployment.md).
+
 ---
 
 ## Why this is different
