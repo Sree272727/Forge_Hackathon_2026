@@ -1,5 +1,9 @@
 """Safe, partial Excel formula evaluator for what-if recalculation.
 
+DEPRECATED CANDIDATE (v1.5) — v2 Option B will replace this with rosetta/evaluator_v2.py
+built on the `formulas` pip package. Do not add new function implementations here.
+Currently still used by rosetta/tools.py::_what_if in v1.5.
+
 We support a pragmatic subset sufficient for the demo workbooks:
   - arithmetic: + - * / ^ % unary -
   - comparisons: = <> > >= < <=

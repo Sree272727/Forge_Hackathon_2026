@@ -13,12 +13,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .audit import audit_workbook
-from .chat import chat as chat_engine
+from .coordinator import answer as coordinator_answer
 from .evaluator import Evaluator
 from .graph import backward_trace, forward_impacted, forward_impacted_for_named_range
 from .models import QAResponse, WhatIfImpact, WhatIfResponse
 from .parser import parse_workbook
-from .qa import answer
+from .qa import answer  # legacy /ask endpoint still uses the regex router
 from .store import chat_store, store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -78,7 +78,7 @@ def chat_endpoint(req: ChatRequest) -> dict[str, Any]:
     if not wb:
         raise HTTPException(404, "workbook_id not found — ingest first")
     session = chat_store.get_or_create(req.session_id, req.workbook_id)
-    return chat_engine(wb, session, req.message)
+    return coordinator_answer(wb, session, req.message)
 
 
 @app.get("/chat/{session_id}/history")
@@ -89,7 +89,45 @@ def chat_history(session_id: str) -> dict[str, Any]:
     return {
         "session_id": session.session_id,
         "workbook_id": session.workbook_id,
-        "messages": session.messages,
+        "messages": [{"role": m.role, "content": m.content, "turn_id": m.turn_id}
+                     for m in session.messages],
+        "active_entity": session.active_entity,
+        "scenario_overrides": session.scenario_overrides,
+    }
+
+
+class ScenarioSetRequest(BaseModel):
+    overrides: dict[str, Any]
+
+
+@app.post("/chat/{session_id}/scenario")
+def set_scenario(session_id: str, req: ScenarioSetRequest) -> dict[str, Any]:
+    session = chat_store.get(session_id)
+    if not session:
+        raise HTTPException(404, "session not found")
+    session.set_scenario(req.overrides)
+    return {"session_id": session_id, "scenario_overrides": session.scenario_overrides}
+
+
+@app.delete("/chat/{session_id}/scenario")
+def clear_scenario(session_id: str, ref: Optional[str] = None) -> dict[str, Any]:
+    session = chat_store.get(session_id)
+    if not session:
+        raise HTTPException(404, "session not found")
+    session.clear_scenario(ref)
+    return {"session_id": session_id, "scenario_overrides": session.scenario_overrides}
+
+
+@app.get("/diagnostics")
+def diagnostics() -> dict[str, Any]:
+    import os
+    return {
+        "version": "v1.5",
+        "workbooks_loaded": len(store.list()),
+        "active_sessions": len(chat_store._sessions),  # type: ignore[attr-defined]
+        "anthropic_api_key_set": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        "model": os.environ.get("ROSETTA_MODEL", "claude-sonnet-4-5"),
+        "semantic_search_enabled": os.environ.get("ROSETTA_SEMANTIC_ENABLED") == "1",
     }
 
 

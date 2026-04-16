@@ -16,6 +16,11 @@ const API_BASE = (location.port === "7272" || location.protocol === "file:") ? "
   const statusText = document.getElementById("status-text");
   const chipGroup = document.getElementById("chip-group");
 
+  const scenarioSection = document.getElementById("scenario-section");
+  const scenariosEl = document.getElementById("scenarios");
+  const entitySection = document.getElementById("active-entity-section");
+  const activeEntityEl = document.getElementById("active-entity");
+
   let workbookId = null;
   let sessionId = localStorage.getItem("rosetta.session_id") || null;
 
@@ -75,17 +80,34 @@ const API_BASE = (location.port === "7272" || location.protocol === "file:") ? "
     if (role === "assistant") {
       const meta = document.createElement("div");
       meta.className = "meta";
+
+      // Audit status badge (green/yellow/red)
+      if (extras.audit_status) {
+        const auditBadge = document.createElement("span");
+        auditBadge.className = `badge audit-${extras.audit_status}`;
+        auditBadge.textContent = {
+          "passed": "✓ grounded",
+          "partial": "⚠ partial",
+          "unknown": "✗ unverified",
+        }[extras.audit_status] || extras.audit_status;
+        meta.appendChild(auditBadge);
+      }
+
+      // Tool-call badge
       if (extras.escalated) {
         const badge = document.createElement("span");
         badge.className = "badge escalated";
         badge.textContent = "tool-calling";
         meta.appendChild(badge);
-      } else {
-        const badge = document.createElement("span");
-        badge.className = "badge";
-        badge.textContent = "grounded";
-        meta.appendChild(badge);
       }
+
+      // Tool count
+      if (typeof extras.tool_calls_made === "number" && extras.tool_calls_made > 0) {
+        const tc = document.createElement("span");
+        tc.textContent = `${extras.tool_calls_made} tool calls`;
+        meta.appendChild(tc);
+      }
+
       if (typeof extras.confidence === "number") {
         const conf = document.createElement("span");
         conf.textContent = `confidence ${extras.confidence.toFixed(2)}`;
@@ -199,6 +221,43 @@ const API_BASE = (location.port === "7272" || location.protocol === "file:") ? "
     }
   }
 
+  function renderScenarios(overrides) {
+    const entries = Object.entries(overrides || {});
+    if (entries.length === 0) {
+      scenarioSection.classList.add("hidden");
+      scenariosEl.innerHTML = "";
+      return;
+    }
+    scenarioSection.classList.remove("hidden");
+    scenariosEl.innerHTML = entries.map(([k, v]) =>
+      `<span class="scenario-chip"><span>${escapeHtml(k)}: ${escapeHtml(fmt(v))}</span><button data-ref="${escapeHtml(k)}" class="clear-scenario" title="Clear">✕</button></span>`
+    ).join("");
+  }
+
+  function renderActiveEntity(ref) {
+    if (!ref) {
+      entitySection.classList.add("hidden");
+      return;
+    }
+    entitySection.classList.remove("hidden");
+    activeEntityEl.textContent = ref;
+  }
+
+  scenariosEl.addEventListener("click", async (e) => {
+    const btn = e.target.closest(".clear-scenario");
+    if (!btn || !sessionId) return;
+    const ref = btn.dataset.ref;
+    try {
+      const res = await fetch(`${API_BASE}/chat/${sessionId}/scenario?ref=${encodeURIComponent(ref)}`, {
+        method: "DELETE",
+      });
+      if (res.ok) {
+        const data = await res.json();
+        renderScenarios(data.scenario_overrides);
+      }
+    } catch (err) { /* ignore */ }
+  });
+
   // --- Send ---
   async function sendMessage(text) {
     if (!workbookId) {
@@ -224,7 +283,11 @@ const API_BASE = (location.port === "7272" || location.protocol === "file:") ? "
         trace: data.trace,
         escalated: data.escalated,
         confidence: data.confidence,
+        audit_status: data.audit_status,
+        tool_calls_made: data.tool_calls_made,
       });
+      if (data.scenario_overrides !== undefined) renderScenarios(data.scenario_overrides);
+      if (data.active_entity !== undefined) renderActiveEntity(data.active_entity);
     } catch (err) {
       hideTyping();
       addMessage("assistant", `Error: ${err.message}`);

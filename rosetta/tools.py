@@ -36,12 +36,13 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "find_cells",
-        "description": "Search for cells by semantic label keyword (e.g. 'EBITDA', 'gross profit', 'Site Alpha'). Returns up to 20 candidate cells with their refs, labels, values, and formula presence.",
+        "description": "Search for cells by semantic label keyword or canonical ref. 3-tier lookup: 'exact' (canonical ref or named range name), 'keyword' (substring match on labels), 'semantic' (embedding similarity — only available if v2 is deployed; otherwise returns empty). 'auto' tries exact → keyword → semantic in order.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "keyword": {"type": "string", "description": "A substring to match against cell semantic labels (case-insensitive)."},
+                "keyword": {"type": "string", "description": "The search query (e.g. 'EBITDA', 'P&L Summary!G32', 'floor plan rate')."},
                 "has_formula": {"type": "boolean", "description": "If true, only return cells that have a formula.", "default": False},
+                "tier": {"type": "string", "description": "One of: 'auto' (default), 'exact', 'keyword', 'semantic'.", "default": "auto"},
             },
             "required": ["keyword"],
         },
@@ -106,6 +107,30 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["target", "new_value"],
         },
     },
+    {
+        "name": "get_workbook_summary",
+        "description": "Return a high-level summary of the workbook: sheet names, named range count, circular refs, audit finding counts. Call this once at the start of a new question to orient yourself if you haven't already.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "scenario_recalc",
+        "description": "Recompute one or more target cells with multiple input overrides applied. Unlike what_if (single target), this supports composing scenarios (e.g. FloorPlanRate=7% AND ReconCostCap=3000). Returns new values for cells that changed.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "overrides": {
+                    "type": "object",
+                    "description": "Dict mapping cell_ref_or_named_range to new value. Example: {\"FloorPlanRate\": 0.07, \"ReconCostCap\": 3000}.",
+                },
+                "target_refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional specific cells to recompute. If omitted, recomputes all cells impacted by the overrides.",
+                },
+            },
+            "required": ["overrides"],
+        },
+    },
 ]
 
 
@@ -120,7 +145,9 @@ def execute_tool(wb: WorkbookModel, name: str, args: dict[str, Any]) -> dict[str
         if name == "get_cell":
             return _get_cell(wb, args["ref"])
         if name == "find_cells":
-            return _find_cells(wb, args["keyword"], args.get("has_formula", False))
+            return _find_cells(wb, args["keyword"],
+                                args.get("has_formula", False),
+                                args.get("tier", "auto"))
         if name == "backward_trace":
             return _backward_trace(wb, args["ref"], int(args.get("max_depth", 6)))
         if name == "forward_impact":
@@ -131,6 +158,10 @@ def execute_tool(wb: WorkbookModel, name: str, args: dict[str, Any]) -> dict[str
             return _list_findings(wb, args.get("category"))
         if name == "what_if":
             return _what_if(wb, args["target"], float(args["new_value"]), int(args.get("max_results", 30)))
+        if name == "get_workbook_summary":
+            return _get_workbook_summary(wb)
+        if name == "scenario_recalc":
+            return _scenario_recalc(wb, args["overrides"], args.get("target_refs"))
         return {"error": f"unknown tool: {name}"}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
@@ -190,26 +221,112 @@ def _get_cell(wb: WorkbookModel, ref: str) -> dict:
     }
 
 
-def _find_cells(wb: WorkbookModel, keyword: str, has_formula: bool) -> dict:
-    kw = keyword.lower().strip()
-    matches: list[dict] = []
-    for ref, cell in wb.cells.items():
-        if has_formula and not cell.formula:
-            continue
-        label = (cell.semantic_label or "").lower()
-        if not label:
-            continue
-        if kw in label:
-            matches.append({
-                "ref": ref,
-                "label": cell.semantic_label,
-                "value": cell.value,
-                "has_formula": cell.formula is not None,
-                "formula": cell.formula,
+def _find_cells(wb: WorkbookModel, keyword: str, has_formula: bool = False,
+                 tier: str = "auto") -> dict:
+    """Three-tier cell lookup.
+
+    Tiers:
+      - exact: canonical cell ref like 'Sheet!A1', or exact named range name
+      - keyword: substring match on cell.semantic_label (case-insensitive)
+      - semantic: embedding similarity (v2 only; v1.5 returns empty stub)
+      - auto: try exact → keyword → semantic until non-empty
+    """
+    tier = tier.lower()
+    if tier not in ("auto", "exact", "keyword", "semantic"):
+        return {"error": f"invalid tier: {tier}"}
+
+    results: list[dict] = []
+    tier_used: str = tier
+
+    def _run_exact() -> list[dict]:
+        out: list[dict] = []
+        q = keyword.strip().replace("$", "")
+        # Direct cell ref
+        if q in wb.cells:
+            cell = wb.cells[q]
+            out.append({
+                "ref": cell.ref, "label": cell.semantic_label, "value": cell.value,
+                "has_formula": cell.formula is not None, "formula": cell.formula,
+                "score": 1.0, "tier_used": "exact",
             })
-        if len(matches) >= 20:
-            break
-    return {"matches": matches, "count": len(matches), "keyword": keyword}
+            return out
+        # Named range name
+        nr = next((n for n in wb.named_ranges if n.name.lower() == q.lower()), None)
+        if nr and nr.resolved_refs:
+            for r in nr.resolved_refs:
+                if ":" in r:
+                    continue
+                cell = wb.cells.get(r)
+                if cell:
+                    out.append({
+                        "ref": cell.ref, "label": cell.semantic_label, "value": cell.value,
+                        "has_formula": cell.formula is not None, "formula": cell.formula,
+                        "score": 1.0, "tier_used": "exact",
+                        "named_range": nr.name,
+                    })
+        return out
+
+    def _run_keyword() -> list[dict]:
+        out: list[dict] = []
+        kw = keyword.lower().strip()
+        if not kw:
+            return out
+        for ref, cell in wb.cells.items():
+            if has_formula and not cell.formula:
+                continue
+            label = (cell.semantic_label or "").lower()
+            if not label:
+                continue
+            if kw in label:
+                score = 0.7 + (0.2 if cell.formula else 0)
+                out.append({
+                    "ref": ref, "label": cell.semantic_label, "value": cell.value,
+                    "has_formula": cell.formula is not None, "formula": cell.formula,
+                    "score": score, "tier_used": "keyword",
+                })
+            if len(out) >= 20:
+                break
+        # Rank: formulas first, then by label specificity
+        out.sort(key=lambda m: (-m["score"], len(m["label"] or "")))
+        return out
+
+    def _run_semantic() -> list[dict]:
+        # v1.5 stub — v2 Option A will implement this via Qdrant
+        import os
+        if os.environ.get("ROSETTA_SEMANTIC_ENABLED") != "1":
+            return []
+        try:
+            from .embeddings import QdrantIndex  # only exists in v2
+            idx = QdrantIndex()
+            results = idx.search(wb.workbook_id, keyword, limit=10)
+            return [
+                {"ref": r["ref"], "label": r["label"], "value": None,
+                 "has_formula": None, "formula": None,
+                 "score": r["score"], "tier_used": "semantic"}
+                for r in results if r["score"] > 0.4
+            ]
+        except Exception:
+            return []
+
+    if tier == "exact":
+        results = _run_exact()
+    elif tier == "keyword":
+        results = _run_keyword()
+    elif tier == "semantic":
+        results = _run_semantic()
+    else:  # auto
+        results = _run_exact()
+        if not results:
+            results = _run_keyword()
+            tier_used = "keyword"
+        else:
+            tier_used = "exact"
+        if not results:
+            results = _run_semantic()
+            tier_used = "semantic" if results else "none"
+
+    return {"matches": results, "count": len(results), "keyword": keyword,
+             "tier_used": tier_used}
 
 
 def _backward_trace(wb: WorkbookModel, ref: str, max_depth: int) -> dict:
@@ -329,4 +446,91 @@ def _what_if(wb: WorkbookModel, target: str, new_value: float, max_results: int)
         "total_changed": len(changes),
         "unsupported_formulas": len(ev.unsupported),
         "changes": changes[:max_results],
+    }
+
+
+def _get_workbook_summary(wb: WorkbookModel) -> dict:
+    from collections import Counter
+    finding_counts = Counter(f.category for f in (wb.findings or []))
+    return {
+        "workbook_id": wb.workbook_id,
+        "filename": wb.filename,
+        "sheet_count": len(wb.sheets),
+        "sheets": [
+            {"name": s.name, "rows": s.max_row, "formulas": s.formula_count,
+             "hidden": s.hidden}
+            for s in wb.sheets
+        ],
+        "named_range_count": len(wb.named_ranges),
+        "named_ranges_sample": [n.name for n in wb.named_ranges[:30]],
+        "has_circular_refs": len(wb.graph_summary.circular_references) > 0,
+        "circular_ref_count": len(wb.graph_summary.circular_references),
+        "total_formula_cells": wb.graph_summary.total_formula_cells,
+        "cross_sheet_edges": wb.graph_summary.cross_sheet_edges,
+        "finding_counts": dict(finding_counts),
+    }
+
+
+def _scenario_recalc(wb: WorkbookModel, overrides: dict[str, Any],
+                      target_refs: list[str] | None) -> dict:
+    """Recompute target_refs (or all impacted) with multi-override scenario.
+
+    overrides keys can be cell refs or named range names.
+    """
+    # Resolve each override key to a cell ref
+    resolved: dict[str, Any] = {}
+    unresolved: list[str] = []
+    for key, val in overrides.items():
+        ref = key.replace("$", "").strip()
+        if ref in wb.cells:
+            resolved[ref] = val
+            continue
+        # Try named range
+        nr = next((n for n in wb.named_ranges if n.name.lower() == key.lower()), None)
+        if nr and nr.resolved_refs and ":" not in nr.resolved_refs[0]:
+            resolved[nr.resolved_refs[0]] = val
+            continue
+        unresolved.append(key)
+
+    if not resolved:
+        return {"error": "No overrides could be resolved to cells",
+                "unresolved": unresolved}
+
+    ev = Evaluator(wb, overrides=resolved)
+
+    # Determine targets
+    if target_refs:
+        target_list = [t.replace("$", "").strip() for t in target_refs]
+    else:
+        # All cells impacted by any override
+        impacted: set[str] = set()
+        for override_ref in resolved:
+            for r, _ in forward_impacted(wb, override_ref):
+                impacted.add(r)
+        target_list = list(impacted)
+
+    recalculated: dict[str, Any] = {}
+    unchanged_count = 0
+    for r in target_list:
+        cell = wb.cells.get(r)
+        if not cell:
+            continue
+        new_v = ev.value_of(r)
+        if new_v != cell.value:
+            recalculated[r] = {
+                "label": cell.semantic_label,
+                "old": cell.value,
+                "new": new_v,
+            }
+        else:
+            unchanged_count += 1
+
+    return {
+        "overrides_applied": resolved,
+        "overrides_unresolved": unresolved,
+        "total_targets": len(target_list),
+        "changed_count": len(recalculated),
+        "unchanged_count": unchanged_count,
+        "unsupported_formulas": list(ev.unsupported)[:30],
+        "recalculated": recalculated,
     }

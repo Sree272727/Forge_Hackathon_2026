@@ -1,6 +1,13 @@
 """Natural language Q&A engine.
 
-Design:
+DEPRECATED (v1.5) — superseded by rosetta/coordinator.py. Retained because:
+  - CANON_ALIASES is imported by the v1.5 find_cells keyword tier
+  - _find_metric_cell, _find_month_column are reused by some tools
+  - Rollback target if ROSETTA_FALLBACK=qa_regex is set
+
+Do not add new features here. New logic belongs in coordinator.py.
+
+Original design:
   1. Classify question into one of 7 intents deterministically.
   2. Retrieve the relevant structured workbook objects.
   3. Build a grounded answer using only parsed data.
