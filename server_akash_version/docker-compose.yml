@@ -1,0 +1,110 @@
+version: '3.8'
+
+services:
+  # Intelligent Excel Services Application
+  excel-services:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: excel-services
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/intellegent-excel
+      - REDIS_URL=redis://redis:6379/0
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - QDRANT_GRPC_PORT=6334
+      - LOG_FORMAT=json
+      - LOG_LEVEL=INFO
+    depends_on:
+      - postgres
+      - redis
+      - qdrant
+    networks:
+      - excel-network
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: excel-postgres
+    environment:
+      - POSTGRES_DB=intellegent-excel
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    networks:
+      - excel-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: excel-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - excel-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Qdrant Vector Database
+  qdrant:
+    image: qdrant/qdrant:v1.9.7
+    container_name: excel-qdrant
+    ports:
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC API
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+      - QDRANT__SERVICE__HTTP_PORT=6333
+      - QDRANT__LOG_LEVEL=INFO
+      # Storage optimization
+      - QDRANT__STORAGE__ON_DISK_PAYLOAD=true
+      # Performance tuning
+      - QDRANT__STORAGE__PERFORMANCE__OPTIMIZERS_DISABLED=false
+      # NOTE: For production, add API key authentication:
+      # - QDRANT__SERVICE__API_KEY=your-secure-api-key
+    volumes:
+      - qdrant_data:/qdrant/storage
+      - qdrant_snapshots:/qdrant/snapshots
+    networks:
+      - excel-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:6333/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+# Networks
+networks:
+  excel-network:
+    driver: bridge
+
+# Volumes
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  qdrant_snapshots:
