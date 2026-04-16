@@ -121,13 +121,21 @@ def clear_scenario(session_id: str, ref: Optional[str] = None) -> dict[str, Any]
 @app.get("/diagnostics")
 def diagnostics() -> dict[str, Any]:
     import os
+    try:
+        from .embeddings import is_enabled as semantic_is_enabled
+        sem_available = semantic_is_enabled()
+    except Exception:
+        sem_available = False
     return {
-        "version": "v1.5",
+        "version": "v2A",
         "workbooks_loaded": len(store.list()),
         "active_sessions": len(chat_store._sessions),  # type: ignore[attr-defined]
         "anthropic_api_key_set": bool(os.environ.get("ANTHROPIC_API_KEY")),
         "model": os.environ.get("ROSETTA_MODEL", "claude-sonnet-4-5"),
-        "semantic_search_enabled": os.environ.get("ROSETTA_SEMANTIC_ENABLED") == "1",
+        "semantic_search_available": sem_available,
+        "semantic_search_disabled_flag": os.environ.get("ROSETTA_SEMANTIC_DISABLED") == "1",
+        "qdrant_url": os.environ.get("QDRANT_URL", "(embedded mode)"),
+        "embedding_model": os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5"),
     }
 
 
@@ -145,10 +153,28 @@ async def ingest(file: UploadFile = File(...)) -> dict[str, Any]:
         store.put(wb)
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+
+    # v2A: build cell contexts + embed + upsert to Qdrant (non-fatal on error)
+    semantic_indexed = 0
+    semantic_error: Optional[str] = None
+    try:
+        from .cell_context import build_cell_contexts
+        from .embeddings import QdrantIndex, is_enabled
+        if is_enabled():
+            contexts = build_cell_contexts(wb)
+            semantic_indexed = QdrantIndex.upsert_cells(wb.workbook_id, contexts)
+    except Exception as e:
+        semantic_error = f"{type(e).__name__}: {e}"
+        logging.getLogger("rosetta.ingest").warning("Semantic index build failed: %s", e)
+
     return {
         "workbook_id": wb.workbook_id,
         "filename": wb.filename,
         "summary": _summarize(wb),
+        "semantic_index": {
+            "indexed_cells": semantic_indexed,
+            "error": semantic_error,
+        },
     }
 
 
