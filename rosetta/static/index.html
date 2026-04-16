@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rosetta — Excel Intelligence</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="logo">R</span>
+      <div>
+        <h1>Rosetta</h1>
+        <p class="tagline">Ask anything about your Excel workbook.</p>
+      </div>
+    </div>
+    <div class="header-actions">
+      <span id="status-dot" class="dot idle"></span>
+      <span id="status-text">No workbook loaded</span>
+    </div>
+  </header>
+
+  <main>
+    <aside class="sidebar">
+      <section class="upload">
+        <label for="file" class="file-label">
+          <span class="file-btn">Upload workbook</span>
+          <input type="file" id="file" accept=".xlsx" hidden />
+        </label>
+        <div id="filename" class="filename"></div>
+      </section>
+
+      <section id="summary" class="summary hidden">
+        <h2>Workbook summary</h2>
+        <ul id="summary-list"></ul>
+        <details id="sheets-detail">
+          <summary>Sheets</summary>
+          <ul id="sheets-list"></ul>
+        </details>
+        <details id="named-detail">
+          <summary>Named ranges</summary>
+          <ul id="named-list"></ul>
+        </details>
+        <details id="findings-detail">
+          <summary>Audit findings</summary>
+          <ul id="findings-list"></ul>
+        </details>
+      </section>
+
+      <section class="chips">
+        <h2>Try asking</h2>
+        <div id="chip-group" class="chip-group">
+          <button class="chip" data-q="How is Adjusted EBITDA calculated?">How is Adjusted EBITDA calculated?</button>
+          <button class="chip" data-q="What is the floor plan rate and where is it used?">What's the floor plan rate — and where is it used?</button>
+          <button class="chip" data-q="What would happen to Used Car gross if the floor plan rate went to 7%?">What if the floor plan rate went to 7%?</button>
+          <button class="chip" data-q="Are there any stale assumptions?">Any stale assumptions?</button>
+          <button class="chip" data-q="Why is the Service Absorption Rate formula circular?">Why is Service Absorption circular?</button>
+          <button class="chip" data-q="Row 23 on the Used Vehicle sheet looks different from the other rows — is something wrong?">Anomaly check</button>
+        </div>
+      </section>
+    </aside>
+
+    <section class="chat">
+      <div id="messages" class="messages">
+        <div class="empty">
+          <p>Upload a workbook and ask a question.</p>
+        </div>
+      </div>
+      <form id="chat-form" class="composer">
+        <input type="text" id="input" placeholder="Ask about a formula, value, dependency…" autocomplete="off" disabled />
+        <button type="submit" id="send" disabled>Send</button>
+      </form>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
