@@ -6,3 +6,7 @@ python-multipart>=0.0.9
 networkx>=3.2
 anthropic>=0.39.0
 python-dotenv>=1.0.0
+# v2A: semantic cell search
+qdrant-client>=1.9.0
+sentence-transformers>=2.7.0
+numpy>=1.24
